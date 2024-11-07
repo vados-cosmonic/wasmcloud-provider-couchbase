@@ -34,11 +34,23 @@ func validateCouchbaseConfig(config map[string]string, secrets map[string]provid
 		connectionArgs.ConnectionString = connectionString
 	}
 
-	password := secrets["password"].String.Reveal()
-	if password == "" {
-		return connectionArgs, errors.New("password secret is required")
+	// NOTE: normaly we'd use the provided secrets for passwords, but to reduce
+	// complexity for the demo, we'll use a configured password secret, if 'allow_unsafe_password'
+	// is present in config
+	if _, exists := config["allow_unsafe_password"]; exists {
+		if password, ok := config["password"]; !ok || password == "" {
+			return connectionArgs, errors.New("password config is required")
+		} else {
+			connectionArgs.Password = password
+		}
 	} else {
-		connectionArgs.Password = password
+		password := secrets["password"].String.Reveal()
+		if password == "" {
+			return connectionArgs, errors.New("password secret is required")
+		} else {
+			connectionArgs.Password = password
+		}
 	}
+
 	return connectionArgs, nil
 }
