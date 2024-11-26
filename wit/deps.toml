@@ -1,1 +1,2 @@
 couchbase = "couchbase"
+keyvalue = "https://github.com/wrpc/keyvalue/archive/v0.2.0-draft.tar.gz"

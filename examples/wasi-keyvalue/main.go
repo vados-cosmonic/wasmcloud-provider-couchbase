@@ -40,9 +40,9 @@ func run() error {
 	}()
 
 	// Initialize the provider with callbacks to track linked components
-	providerHandler := Handler{
-		linkedFrom:         make(map[string]map[string]string),
-		clusterConnections: make(map[string]*gocb.Collection),
+	providerHandler, err := NewHandler()
+	if err != nil {
+		return err
 	}
 
 	p, err := provider.New(

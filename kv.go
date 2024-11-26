@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"time"
 	"errors"
+	"sync"
 
 	"github.com/couchbase/gocb/v2"
-	sdk "go.wasmcloud.dev/provider"
 	wrpc "wrpc.io/go"
+	sdk "go.wasmcloud.dev/provider"
+	"go.opentelemetry.io/otel"
 	wrpcnats "wrpc.io/go/nats"
 
 	// Generated bindings
@@ -16,42 +19,24 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const TRACER_NAME = "wasmcloud-provider-couchbase"
-
 var (
 	errNoSuchStore     = store.NewErrorNoSuchStore()
 	errInvalidDataType = store.NewErrorOther("invalid data type stored in map")
 	tracer             trace.Tracer
 )
 
-// This provider `Handler` stores a global collection for querying.
-// TODO(#): Support storing connections per linked component
-type Handler struct {
+type KVHandler struct {
 	// The provider instance
 	*sdk.WasmcloudProvider
 
-	// All components linked to this provider and their config.
+	linksMutex *sync.RWMutex
 	linkedFrom map[string]map[string]string
-	linksMutex sync.RWMutex
 
-	// Map that stores couchbase cluster connections
+	connectionsMutex *sync.RWMutex
 	clusterConnections map[string]*gocb.Collection
-	connectionsMutex sync.RWMutex
 }
 
-// Create a new Provider
-func NewProvider() (Provider, error) {
-	Handler{
-		linkedFrom:         make(map[string]map[string]string),
-		linksMutex: sync.RWMutex
-		clusterConnections: make(map[string]*gocb.Collection),
-		connectionsMutex: sync.RWMutex
-	}
-}
-
-// Implementation of wasi:keyvalue/store
-
-func (h *Handler) Get(ctx context.Context, bucket string, key string) (*wrpc.Result[[]uint8, store.Error], error) {
+func (h *KVHandler) Get(ctx context.Context, bucket string, key string) (*wrpc.Result[[]uint8, store.Error], error) {
 	ctx = extractTraceHeaderContext(ctx)
 	ctx, span := tracer.Start(ctx, "GET")
 	defer span.End()
@@ -81,22 +66,7 @@ func (h *Handler) Get(ctx context.Context, bucket string, key string) (*wrpc.Res
 	return wrpc.Ok[store.Error](response), nil
 }
 
-func (h *Handler) getCollectionFromContext(ctx context.Context) (*gocb.Collection, error) {
-	header, ok := wrpcnats.HeaderFromContext(ctx)
-	if !ok {
-		h.Logger.Warn("Received request from unknown origin")
-		return nil, errors.New("error fetching header from wrpc context")
-	}
-	// Only allow requests from a linked component
-	sourceId := header.Get("source-id")
-	if h.linkedFrom[sourceId] == nil {
-		h.Logger.Warn("Received request from unlinked source", "sourceId", sourceId)
-		return nil, errors.New("received request from unlinked source")
-	}
-	return h.clusterConnections[sourceId], nil
-}
-
-func (h *Handler) Set(ctx context.Context, bucket string, key string, value []uint8) (*wrpc.Result[struct{}, store.Error], error) {
+func (h *KVHandler) Set(ctx context.Context, bucket string, key string, value []uint8) (*wrpc.Result[struct{}, store.Error], error) {
 	ctx = extractTraceHeaderContext(ctx)
 	ctx, span := tracer.Start(ctx, "SET")
 	defer span.End()
@@ -119,7 +89,7 @@ func (h *Handler) Set(ctx context.Context, bucket string, key string, value []ui
 	return wrpc.Ok[store.Error](struct{}{}), nil
 }
 
-func (h *Handler) Delete(ctx context.Context, bucket string, key string) (*wrpc.Result[struct{}, store.Error], error) {
+func (h *KVHandler) Delete(ctx context.Context, bucket string, key string) (*wrpc.Result[struct{}, store.Error], error) {
 	ctx = extractTraceHeaderContext(ctx)
 	ctx, span := tracer.Start(ctx, "DELETE")
 	defer span.End()
@@ -141,7 +111,7 @@ func (h *Handler) Delete(ctx context.Context, bucket string, key string) (*wrpc.
 	return wrpc.Ok[store.Error](struct{}{}), nil
 }
 
-func (h *Handler) Exists(ctx context.Context, bucket string, key string) (*wrpc.Result[bool, store.Error], error) {
+func (h *KVHandler) Exists(ctx context.Context, bucket string, key string) (*wrpc.Result[bool, store.Error], error) {
 	ctx = extractTraceHeaderContext(ctx)
 	ctx, span := tracer.Start(ctx, "EXISTS")
 	defer span.End()
@@ -163,13 +133,13 @@ func (h *Handler) Exists(ctx context.Context, bucket string, key string) (*wrpc.
 	return wrpc.Ok[store.Error](res.Exists()), nil
 }
 
-func (h *Handler) ListKeys(ctx context.Context, bucket string, cursor *uint64) (*wrpc.Result[store.KeyResponse, store.Error], error) {
+func (h *KVHandler) ListKeys(ctx context.Context, bucket string, cursor *uint64) (*wrpc.Result[store.KeyResponse, store.Error], error) {
 	h.Logger.Warn("received request to list keys")
 	return wrpc.Err[store.KeyResponse](*store.NewErrorOther("list-keys operation not supported")), nil
 }
 
 // Implementation of wasi:keyvalue/atomics
-func (h *Handler) Increment(ctx context.Context, bucket string, key string, delta uint64) (*wrpc.Result[uint64, atomics.Error], error) {
+func (h *KVHandler) Increment(ctx context.Context, bucket string, key string, delta uint64) (*wrpc.Result[uint64, atomics.Error], error) {
 	ctx = extractTraceHeaderContext(ctx)
 	ctx, span := tracer.Start(ctx, "INCREMENT")
 	defer span.End()
@@ -192,4 +162,80 @@ func (h *Handler) Increment(ctx context.Context, bucket string, key string, delt
 	}
 
 	return wrpc.Ok[atomics.Error](res.Content()), nil
+}
+
+// Provider handler functions
+func (h *KVHandler) handleNewTargetLink(link sdk.InterfaceLinkDefinition) error {
+	h.linksMutex.Lock()
+	defer h.linksMutex.Unlock()
+
+	h.Logger.Info("Handling new target link", "link", link)
+	h.linkedFrom[link.SourceID] = link.TargetConfig
+	couchbaseConnectionArgs, err := validateCouchbaseConfig(link.TargetConfig, link.TargetSecrets)
+	if err != nil {
+		h.Logger.Error("Invalid couchbase target config", "error", err)
+		return err
+	}
+	h.updateCouchbaseCluster(link.SourceID, couchbaseConnectionArgs)
+	return nil
+}
+
+func (h *KVHandler) updateCouchbaseCluster(sourceId string, connectionArgs CouchbaseConnectionArgs) {
+	h.connectionsMutex.Lock()
+	defer h.connectionsMutex.Unlock()
+
+	// Connect to the cluster
+	cluster, err := gocb.Connect(connectionArgs.ConnectionString, gocb.ClusterOptions{
+		Username: connectionArgs.Username,
+		Password: connectionArgs.Password,
+		Tracer:   gocbt.NewOpenTelemetryRequestTracer(otel.GetTracerProvider()),
+	})
+	if err != nil {
+		h.Logger.Error("unable to connect to couchbase cluster", "error", err)
+		return
+	}
+	var collection *gocb.Collection
+	if connectionArgs.CollectionName != "" && connectionArgs.ScopeName != "" {
+		collection = cluster.Bucket(connectionArgs.BucketName).Scope(connectionArgs.ScopeName).Collection(connectionArgs.CollectionName)
+	} else {
+		collection = cluster.Bucket(connectionArgs.BucketName).DefaultCollection()
+	}
+
+	bucket := cluster.Bucket(connectionArgs.BucketName)
+	if err = bucket.WaitUntilReady(5*time.Second, nil); err != nil {
+		h.Logger.Error("unable to connect to couchbase bucket", "error", err)
+	}
+
+	// Store the connection
+	h.clusterConnections[sourceId] = collection
+}
+
+func (h *KVHandler) handleDelTargetLink(link sdk.InterfaceLinkDefinition) error {
+	h.linksMutex.Lock()
+	defer h.linksMutex.Unlock()
+
+	h.Logger.Info("Handling del target link", "link", link)
+	delete(h.linkedFrom, link.Target)
+	return nil
+}
+
+// Helper function to get the correct collection from the invocation context
+func (h *KVHandler) getCollectionFromContext(ctx context.Context) (*gocb.Collection, error) {
+	h.linksMutex.Lock()
+	h.connectionsMutex.Lock()
+	defer h.connectionsMutex.Unlock()
+	defer h.linksMutex.Unlock()
+
+	header, ok := wrpcnats.HeaderFromContext(ctx)
+	if !ok {
+		h.Logger.Warn("Received request from unknown origin")
+		return nil, errors.New("error fetching header from wrpc context")
+	}
+	// Only allow requests from a linked component
+	sourceId := header.Get("source-id")
+	if h.linkedFrom[sourceId] == nil {
+		h.Logger.Warn("Received request from unlinked source", "sourceId", sourceId)
+		return nil, errors.New("received request from unlinked source")
+	}
+	return h.clusterConnections[sourceId], nil
 }
