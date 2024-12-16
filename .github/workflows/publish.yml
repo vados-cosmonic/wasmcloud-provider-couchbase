@@ -2,11 +2,9 @@ name: publish
 
 on:
   push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - feat=publish-package
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+*
+      - v[0-9]+.[0-9]+.[0-9]+-*
 
 permissions:
   contents: read
@@ -59,7 +57,7 @@ jobs:
         with:
           tool: wash-cli@${{ matrix.cfg.wash-version }},wit-bindgen-cli
 
-      - name: Install commitsar
+      - name: Install wrpc
         uses: jaxxstorm/action-install-gh-release@cd6b2b78ad38bdd294341cda064ec0692b06215b
         with:
           repo: bytecodealliance/wrpc
